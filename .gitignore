@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+*.pem
+*.key
+*.log
+.DS_Store
+.idea/
+.vscode/
+infra/idp/exports/
+coverage
