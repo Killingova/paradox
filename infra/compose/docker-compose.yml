@@ -1,0 +1,21 @@
+version: "3.9"
+services:
+  postgres_keycloack:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: kc
+      POSTGRES_PASSWORD: kcpass
+    volumes: 
+      - kc_pgdata: /var/lib/postgresql/data
+
+  keycloack: 
+      image: quay.io/keycloack/keycloak: 26.0
+      command: start-dev
+      environment: 
+          KEYCLOAK_ADMIN: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+          KC_DB: postgres
+          KC_DB_URL: jdbc:postgresql: //postgres_keycloack: 5432/keycloak
+
+
