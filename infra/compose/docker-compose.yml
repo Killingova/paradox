@@ -8,7 +8,7 @@ services:
       POSTGRES_DB: ${KC_DB_NAME:-keycloak}
       POSTGRES_USER: ${KC_DB_USER:-kc}
       POSTGRES_PASSWORD: ${KC_DB_PASS:-kcpass}
-      TZ: Europe/Berlin
+      TZ: ${TZ:-Europe/Berlin}
     volumes:
       - kc_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -17,13 +17,12 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    networks:
-      - keycloak_net
+    networks: [core]
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: ppx-keycloak
-    command: start-dev
+    command: ["start-dev", "--http-relative-path=/auth"]
     environment:
       KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASS:-admin}
@@ -33,24 +32,33 @@ services:
       KC_DB_PASSWORD: ${KC_DB_PASS:-kcpass}
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
-      TZ: Europe/Berlin
+      TZ: ${TZ:-Europe/Berlin}
     depends_on:
       postgres_keycloak:
         condition: service_healthy
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"   # Nur intern für NGINX sichtbar
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
-    networks:
-      - keycloak_net
+    networks: [core]
+
+  nginx:
+    image: nginx:1.27
+    container_name: ppx-nginx
+    volumes:
+      - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"   # Browser → NGINX → Keycloak
+    depends_on: [keycloak]
+    networks: [edge, core]
 
 volumes:
   kc_pgdata:
 
 networks:
-  keycloak_net:
-    driver: bridge
+  core:
+  edge:
