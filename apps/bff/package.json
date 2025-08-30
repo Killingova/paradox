@@ -1,0 +1,16 @@
+{
+  "name":"paradox-bff",
+  "privare": true,
+  "version": "o.1.0",
+  "main": "server.js",
+  "type": "module",
+  "scropts": {
+    "start": "node_server.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.6",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "openid-client": "^6.2.3"
+  }
+}
