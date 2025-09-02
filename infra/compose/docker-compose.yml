@@ -37,12 +37,52 @@ services:
       postgres_keycloak:
         condition: service_healthy
     expose:
-      - "8080"   # Nur intern für NGINX sichtbar
+      - "8080"   # nur intern
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
+    networks: [core]
+
+  redis:
+    image: redis:7
+    container_name: ppx-redis
+    command: ["redis-server","--appendonly","yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [core]
+
+  bff:
+    build:
+      context: ../../apps/bff
+    container_name: ppx-bff
+    environment:
+      - OIDC_ISSUER=${OIDC_ISSUER}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI}
+      - OIDC_POST_LOGOUT_REDIRECT_URI=${OIDC_POST_LOGOUT_REDIRECT_URI}
+      - COOKIE_NAME=paradox_sid
+      - COOKIE_SECURE=false
+      - COOKIE_SAMESITE=Lax
+      - REDIS_URL=redis://redis:6379
+      - SESSION_TTL_SECONDS=604800
+      - PORT=3000
+    depends_on:
+      keycloak:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    expose:
+      - "3000"
     restart: unless-stopped
     networks: [core]
 
@@ -52,12 +92,15 @@ services:
     volumes:
       - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "80:80"   # Browser → NGINX → Keycloak
-    depends_on: [keycloak]
+      - "80:80"
+    depends_on:
+      - keycloak
+      - bff
     networks: [edge, core]
 
 volumes:
   kc_pgdata:
+  redisdata:
 
 networks:
   core:
