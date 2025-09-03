@@ -1,4 +1,4 @@
-version: "3.9"
+# ~/paradox/infra/compose/docker-compose.yml
 
 services:
   postgres_keycloak:
@@ -22,7 +22,10 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: ppx-keycloak
-    command: ["start-dev", "--http-relative-path=/auth", "--hostname-strict=false"]
+    command:
+      - start-dev
+      - --http-relative-path=/auth
+      - --hostname-strict=false
     environment:
       KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASS:-admin}
@@ -36,13 +39,7 @@ services:
     depends_on:
       postgres_keycloak:
         condition: service_healthy
-    expose:
-      - "8080"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/auth/health/ready || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+    expose: ["8080","9000"]   # Hinweis: kein Healthcheck hier
     restart: unless-stopped
     networks: [core]
 
@@ -63,29 +60,47 @@ services:
   bff:
     build:
       context: ../../apps/bff
-    container_name: ppx-bff
+      dockerfile: Dockerfile
+    image: compose-bff
+    container_name: compose-bff-1
     env_file:
-      - ../../apps/bff/.env        # <— HIER holt er alle OIDC_/COOKIE_/REDIS_ Werte
+      - ../../apps/bff/.env
+    environment:
+      PORT: 3000
+      REDIS_URL: redis://redis:6379
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      COOKIE_SAMESITE: "${COOKIE_SAMESITE:-Lax}"
+      SESSION_TTL_SECONDS: "${SESSION_TTL_SECONDS:-604800}"
+      TZ: ${TZ:-Europe/Berlin}
     depends_on:
       keycloak:
-        condition: service_started
+        condition: service_started     # <— geändert
       redis:
         condition: service_healthy
-    expose:
-      - "3000"
+    expose: ["3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/bff/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped
-    networks: [core]
+    networks: [core, edge]
 
   nginx:
     image: nginx:1.27
     container_name: ppx-nginx
     volumes:
       - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/keycloak-ssl.conf:/etc/nginx/conf.d/keycloak-ssl.conf:ro
+      - ../nginx/tls:/etc/nginx/tls:ro
     ports:
       - "80:80"
+      - "8443:8443"
     depends_on:
-      - keycloak
-      - bff
+      keycloak:
+        condition: service_started     # <— geändert
+      bff:
+        condition: service_healthy
     restart: unless-stopped
     networks: [edge, core]
 

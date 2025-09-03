@@ -1,36 +1,40 @@
 // server.js – BFF (Backend-for-Frontend) für OIDC-Login via Keycloak
-// Zweck: Sichere Auth im Browser ohne Tokens im LocalStorage. Cookies + Redis-Session.
+// Stack: Node 20 (ESM), openid-client v6 (ESM), Express 4, Redis (ioredis)
 
 import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
-import { Issuer, generators } from "openid-client"; // OIDC-Client-Lib (PKCE, Discovery etc.)
-import Redis from "ioredis"; // Session- & State-Speicher
+import * as oidc from "openid-client";     // v6: Funktions-API als Namespace
+import Redis from "ioredis";
 
-/**
- * 1) ENV laden + Defaults
- *    Diese Variablen kommen aus .env / Docker / K8s Secrets.
- *    Sie steuern, gegen welchen IdP (Keycloak) wir sprechen und wie Cookies gesetzt werden.
- */
+/* =========================================
+ * 1) ENV & Defaults
+ * ======================================= */
 const {
-  OIDC_ISSUER,                     // z.B. https://idp.local/realms/paradox
-  OIDC_CLIENT_ID,                  // Client in Keycloak (typisch: "bff")
-  OIDC_CLIENT_SECRET,              // nur für confidential clients nötig
-  OIDC_REDIRECT_URI,               // z.B. https://app.local/bff/callback
-  OIDC_POST_LOGOUT_REDIRECT_URI,   // Ziel nach Abmeldung am IdP
-  COOKIE_NAME = "paradox_sid",     // Name des Session-Cookies
-  COOKIE_SECURE = "false",          // in PROD: true (nur über HTTPS senden)
-  COOKIE_SAMESITE = "Lax",          // in PROD: Strict oder None(+Secure)
-  REDIS_URL = "redis://redis:6379", // Redis-Endpoint
-  SESSION_TTL_SECONDS = "604800",   // 7 Tage Session-Lebensdauer
+  // OIDC / Keycloak
+  OIDC_ISSUER,                    // z.B. http://keycloak:8080/auth/realms/paradoxon (DEV) | https://idp.tld/realms/...
+  OIDC_CLIENT_ID,                 // z.B. bff
+  OIDC_CLIENT_SECRET,             // confidential client → Secret
+  OIDC_REDIRECT_URI,              // z.B. http://192.168.178.117/bff/callback
+  OIDC_POST_LOGOUT_REDIRECT_URI,  // z.B. http://192.168.178.117/
+  OIDC_ALLOW_INSECURE_HTTP = "false", // DEV: "true" erlaubt HTTP zum Issuer
+
+  // Cookies & Session
+  COOKIE_NAME = "paradox_sid",
+  COOKIE_SECURE = "false",        // PROD: "true" (nur über HTTPS)
+  COOKIE_SAMESITE = "Lax",        // PROD: "Strict" oder "None"(+Secure)
+  REDIS_URL = "redis://redis:6379",
+  SESSION_TTL_SECONDS = "604800", // 7 Tage
+
+  // Server
   PORT = "3000",
 } = process.env;
 
-// kleine Helfer
 const bool = (v) => String(v).toLowerCase() === "true";
 const makeId = (n = 32) => crypto.randomBytes(n).toString("base64url");
+const safeJsonParse = (raw) => { try { return raw ? JSON.parse(raw) : null; } catch { return null; } };
 
-// Minimal-Check auf Pflicht-ENV (früher Crash statt später kryptischer Fehler)
+// Pflicht-ENV früh prüfen (klarer Fail statt später kryptisch)
 function assertEnv(name, val) {
   if (!val) {
     console.error(`[ENV] ${name} fehlt.`);
@@ -42,71 +46,57 @@ assertEnv("OIDC_CLIENT_ID", OIDC_CLIENT_ID);
 assertEnv("OIDC_REDIRECT_URI", OIDC_REDIRECT_URI);
 assertEnv("OIDC_POST_LOGOUT_REDIRECT_URI", OIDC_POST_LOGOUT_REDIRECT_URI);
 
-/**
- * 2) Redis – State & Session Storage
- *    - Speichert PKCE-State (während Login-Flow)
- *    - Speichert BFF-Sessions (sid → {sub, email, name, refresh_token, ...})
- */
+/* =========================================
+ * 2) DEV: HTTP zu Issuer erlauben (nur lokal!)
+ *    openid-client v6 verbietet HTTP standardmäßig.
+ * ======================================= */
+if (bool(OIDC_ALLOW_INSECURE_HTTP)) {
+  // ACHTUNG: nur in DEV verwenden!
+  oidc.custom.setHttpOptionsDefaults({ allowInsecureRequests: true });
+}
+
+/* =========================================
+ * 3) Redis – State & Session
+ * ======================================= */
 const redis = new Redis(REDIS_URL, { lazyConnect: true });
 await redis.connect().catch((e) => {
   console.error("Redis-Verbindung fehlgeschlagen:", e);
   process.exit(1);
 });
 
-/**
- * 3) OIDC Client per Discovery
- *    - Holt Endpunkte/Keys automatisch bei OIDC_ISSUER (/.well-known/openid-configuration)
- *    - Initialisiert Client für Code-Flow + PKCE
- */
-let client;
-let issuer;
+/* =========================================
+ * 4) OIDC Discovery (v6 Funktions-API)
+ *    → liefert eine „Konfiguration“ (server/client Metadata + Helper)
+ * ======================================= */
+let conf;
 try {
-  issuer = await Issuer.discover(`${OIDC_ISSUER}`);
-  client = new issuer.Client({
-    client_id: OIDC_CLIENT_ID,
-    client_secret: OIDC_CLIENT_SECRET, // bei Public Clients weglassen
-    redirect_uris: [OIDC_REDIRECT_URI],
-    response_types: ["code"], // Authorization Code Flow
-  });
+  const issuerUrl = new URL(String(OIDC_ISSUER));
+  conf = await oidc.discovery(issuerUrl, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET);
 } catch (e) {
-  console.error("OIDC Discovery/Client-Init fehlgeschlagen:", e);
+  console.error("OIDC Discovery fehlgeschlagen:", e);
   process.exit(1);
 }
 
-/**
- * 4) Express-Setup
- *    - trust proxy: wichtig, wenn vor dem BFF ein Reverse-Proxy (nginx) mit TLS steht
- *    - JSON-Parsing & Cookies
- */
+/* =========================================
+ * 5) Express Setup
+ * ======================================= */
 const app = express();
-app.set("trust proxy", 1);
+app.set("trust proxy", 1);     // wichtig hinter nginx/Proxy
 app.use(express.json());
 app.use(cookieParser());
 
-/**
- * 5) Hilfs-Middlewares
- *    - loadSession: lädt Session aus Redis anhand des httpOnly Cookies
- *    - rateLimit: einfacher per-IP Rate Limiter (Schutz vor Brute Force/Abuse)
- *    - requireCsrf: Double-Submit Cookie + Header (Schutz für POST/PUT/DELETE)
- */
-function safeJsonParse(raw) {
-  try { return raw ? JSON.parse(raw) : null; } catch { return null; }
-}
-
+/* =========================================
+ * 6) Middlewares & Helpers
+ * ======================================= */
 async function loadSession(req, _res, next) {
   try {
     const sid = req.cookies[COOKIE_NAME];
     if (!sid) return next();
     const raw = await redis.get(`sess:${sid}`);
     const session = safeJsonParse(raw);
-    if (session) {
-      req.session = session; // user claims & refresh_token
-      req.sid = sid;         // referenz für update/löschen
-    }
-    return next();
-  } catch (e) {
-    return next(e);
-  }
+    if (session) { req.session = session; req.sid = sid; }
+    next();
+  } catch (e) { next(e); }
 }
 
 function rateLimit({ keyPrefix, limit = 10, windowSec = 60 }) {
@@ -116,11 +106,8 @@ function rateLimit({ keyPrefix, limit = 10, windowSec = 60 }) {
       const cur = await redis.incr(key);
       if (cur === 1) await redis.expire(key, windowSec);
       if (cur > limit) return res.status(429).json({ ok: false, error: "rate_limited" });
-      return next();
-    } catch (e) {
-      // wenn Redis down → kein Limit (alternativ 503 senden)
-      return next();
-    }
+      next();
+    } catch { next(); }
   };
 }
 
@@ -130,84 +117,85 @@ function requireCsrf(req, res, next) {
   if (!cookie || !header || cookie !== header) {
     return res.status(403).json({ ok: false, error: "csrf" });
   }
-  return next();
+  next();
 }
 
-/**
- * 6) Healthcheck – für Monitoring/K8s Probes
- */
+/* =========================================
+ * 7) Health
+ * ======================================= */
 app.get("/bff/health", (_req, res) => res.type("text").send("bff: ok\n"));
 
-/**
- * 7) /bff/login – Start des OIDC Flows mit PKCE
- *    - Erzeugt state + code_verifier
- *    - Speichert code_verifier 5 Min in Redis (gegen CSRF/Replay)
- *    - Redirect zum IdP (Keycloak) mit code_challenge
- */
-app.get("/bff/login", rateLimit({ keyPrefix: "login", limit: 12, windowSec: 60 }), async (_req, res, next) => {
-  try {
-    const state = makeId(16);
-    const code_verifier = generators.codeVerifier();
-    const code_challenge = generators.codeChallenge(code_verifier);
+/* =========================================
+ * 8) /bff/login – Authorization Code + PKCE
+ * ======================================= */
+app.get("/bff/login",
+  rateLimit({ keyPrefix: "login", limit: 12, windowSec: 60 }),
+  async (_req, res, next) => {
+    try {
+      const state = makeId(16);
+      const code_verifier  = oidc.randomPKCECodeVerifier();
+      const code_challenge = await oidc.calculatePKCECodeChallenge(code_verifier);
 
-    await redis.setex(`oidc:${state}`, 300, JSON.stringify({ code_verifier }));
+      // 5 Minuten PKCE-State
+      await redis.setex(`oidc:${state}`, 300, JSON.stringify({ code_verifier }));
 
-    const authUrl = client.authorizationUrl({
-      scope: "openid profile email offline_access",
-      state,
-      code_challenge,
-      code_challenge_method: "S256",
-    });
+      const url = oidc.buildAuthorizationUrl(conf, {
+        redirect_uri: OIDC_REDIRECT_URI,
+        scope: "openid profile email offline_access",
+        state,
+        code_challenge,
+        code_challenge_method: "S256",
+      });
 
-    return res.redirect(authUrl);
-  } catch (e) {
-    return next(e);
+      return res.redirect(url.href);
+    } catch (e) { return next(e); }
   }
-});
+);
 
-/**
- * 8) /bff/callback – tauscht Code gegen Tokens
- *    - Validiert state und liest code_verifier aus Redis
- *    - Holt tokenSet (id_token, access_token, refresh_token)
- *    - Erzeugt eigene BFF-Session (sid) und legt sie in Redis ab
- *    - Setzt httpOnly Session-Cookie + nicht-httpOnly CSRF-Cookie
- *    - Redirect zurück zur SPA (/)
- */
+/* =========================================
+ * 9) /bff/callback – Code → Tokens + Session
+ * ======================================= */
 app.get("/bff/callback", async (req, res, next) => {
   try {
-    const params = client.callbackParams(req);
-    const entry = await redis.get(`oidc:${params.state}`);
+    const currentUrl = new URL(`${req.protocol}://${req.get("host")}${req.originalUrl}`);
+    const state = currentUrl.searchParams.get("state");
+    if (!state) return res.status(400).send("missing state");
+
+    const entry = await redis.get(`oidc:${state}`);
     if (!entry) return res.status(400).send("invalid state");
     const { code_verifier } = JSON.parse(entry);
+    await redis.del(`oidc:${state}`);
 
-    const tokenSet = await client.callback(
-      OIDC_REDIRECT_URI,
-      params,
-      { state: params.state, code_verifier }
-    );
-    await redis.del(`oidc:${params.state}`);
+    const tokens = await oidc.authorizationCodeGrant(conf, currentUrl, {
+      pkceCodeVerifier: code_verifier,
+      expectedState: state,
+    });
 
-    const claims = tokenSet.claims();
+    // Optional: UserInfo
+    let user = { sub: undefined, email: undefined, name: undefined };
+    try {
+      const meta = conf.serverMetadata();
+      if (meta.userinfo_endpoint && tokens.access_token) {
+        const info = await oidc.userInfo(conf, tokens.access_token);
+        user = { sub: info.sub, email: info.email, name: info.name || info.preferred_username };
+      }
+    } catch { /* ignore */ }
 
-    // Minimal-User-Session (nur notwendige Daten speichern)
+    // Session speichern
     const sid = makeId(24);
     const session = {
-      sub: claims.sub,
-      email: claims.email,
-      name: claims.name || claims.preferred_username,
-      id_token: tokenSet.id_token,           // optional für End-Session am IdP
-      refresh_token: tokenSet.refresh_token, // für /bff/refresh
+      sub: user.sub,
+      email: user.email,
+      name: user.name,
+      id_token: tokens.id_token,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
       created_at: Date.now(),
     };
+    await redis.setex(`sess:${sid}`, parseInt(SESSION_TTL_SECONDS, 10), JSON.stringify(session));
 
-    await redis.setex(
-      `sess:${sid}`,
-      parseInt(SESSION_TTL_SECONDS, 10),
-      JSON.stringify(session)
-    );
-
-    // httpOnly Session-Cookie → nicht per JS lesbar (XSS-Schutz)
-    const secure = bool(COOKIE_SECURE);
+    // Cookies setzen
+    const secure   = bool(COOKIE_SECURE);
     const sameSite = COOKIE_SAMESITE; // "Lax" | "Strict" | "None"
     if (sameSite === "None" && !secure) {
       console.warn("Warnung: SameSite=None verlangt Secure=true. Bitte in PROD setzen.");
@@ -221,10 +209,9 @@ app.get("/bff/callback", async (req, res, next) => {
       maxAge: parseInt(SESSION_TTL_SECONDS, 10) * 1000,
     });
 
-    // CSRF-Token als eigenes Cookie (vom Frontend als Header zurücksenden)
     const csrf = makeId(16);
     res.cookie("paradox_csrf", csrf, {
-      httpOnly: false, // Frontend muss den Wert lesen können
+      httpOnly: false, // Frontend muss lesen können
       secure,
       sameSite,
       path: "/",
@@ -232,76 +219,69 @@ app.get("/bff/callback", async (req, res, next) => {
     });
 
     return res.redirect("/");
-  } catch (e) {
-    return next(e);
-  }
+  } catch (e) { return next(e); }
 });
 
-/**
- * 9) /bff/me – User-Info aus der BFF-Session (kein Access-Token im Browser)
- */
-app.get("/bff/me", loadSession, async (req, res) => {
+/* =========================================
+ * 10) /bff/me – Session-User
+ * ======================================= */
+app.get("/bff/me", loadSession, (req, res) => {
   if (!req.session) return res.status(401).json({ ok: false, user: null });
   const { sub, email, name } = req.session;
   return res.json({ ok: true, user: { sub, email, name } });
 });
 
-/**
- * 10) /bff/refresh – Refresh Token Flow (Rotation optional erweiterbar)
- *     - geschützt mit CSRF + gültiger Session
- *     - holt neuen refresh_token und aktualisiert Session-TTL
- */
-app.post("/bff/refresh", requireCsrf, loadSession, async (req, res, next) => {
+/* =========================================
+ * 11) /bff/refresh – Refresh Token
+ * ======================================= */
+app.post("/bff/refresh", requireCsrf, loadSession, async (req, res) => {
   if (!req.session?.refresh_token) return res.status(401).json({ ok: false });
   try {
-    const refreshed = await client.refresh(req.session.refresh_token);
+    const refreshed = await oidc.refreshTokenGrant(conf, req.session.refresh_token);
     req.session.refresh_token = refreshed.refresh_token || req.session.refresh_token;
-    await redis.setex(
-      `sess:${req.sid}`,
-      parseInt(SESSION_TTL_SECONDS, 10),
-      JSON.stringify(req.session)
-    );
+    req.session.access_token  = refreshed.access_token  || req.session.access_token;
+    await redis.setex(`sess:${req.sid}`, parseInt(SESSION_TTL_SECONDS, 10), JSON.stringify(req.session));
     return res.json({ ok: true });
-  } catch (e) {
-    // Refresh fehlgeschlagen → Session löschen und Cookies leeren
+  } catch {
     try { if (req.sid) await redis.del(`sess:${req.sid}`); } catch {}
     res.clearCookie(COOKIE_NAME, { path: "/" });
+    res.clearCookie("paradox_csrf", { path: "/" });
     return res.status(401).json({ ok: false });
   }
 });
 
-/**
- * 11) /bff/logout – lokale Session löschen + optional IdP-End-Session
- */
-app.post("/bff/logout", requireCsrf, loadSession, async (req, res, _next) => {
+/* =========================================
+ * 12) /bff/logout – lokale Session + optional IdP-End-Session
+ * ======================================= */
+app.post("/bff/logout", requireCsrf, loadSession, async (req, res) => {
   try { if (req.sid) await redis.del(`sess:${req.sid}`); } catch {}
   res.clearCookie(COOKIE_NAME, { path: "/" });
   res.clearCookie("paradox_csrf", { path: "/" });
 
   try {
-    const end = issuer.end_session_endpoint; // Keycloak Endsession Endpoint
+    const end = conf.serverMetadata().end_session_endpoint;
     if (end && req.session?.id_token) {
       const url = new URL(end);
       url.searchParams.set("post_logout_redirect_uri", OIDC_POST_LOGOUT_REDIRECT_URI);
       url.searchParams.set("id_token_hint", req.session.id_token);
       return res.redirect(url.toString());
     }
-  } catch { /* ignorieren */ }
+  } catch { /* ignore */ }
 
   return res.redirect("/");
 });
 
-/**
- * 12) Globaler Error-Handler – letzte Verteidigungslinie
- */
+/* =========================================
+ * 13) Error-Handler
+ * ======================================= */
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
   return res.status(500).json({ ok: false, error: "internal_error" });
 });
 
-/**
- * 13) Start – Server lauscht
- */
+/* =========================================
+ * 14) Start
+ * ======================================= */
 app.listen(parseInt(PORT, 10), () => {
   console.log(`BFF listening on ${PORT}`);
 });
