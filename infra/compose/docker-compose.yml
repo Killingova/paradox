@@ -22,7 +22,6 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: ppx-keycloak
-    # Health/Paths liegen unter /auth, deshalb relative path beibehalten:
     command: ["start-dev", "--http-relative-path=/auth", "--hostname-strict=false"]
     environment:
       KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
@@ -40,7 +39,6 @@ services:
     expose:
       - "8080"
     healthcheck:
-      # WICHTIG: mit /auth prefix!
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/auth/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
@@ -66,18 +64,8 @@ services:
     build:
       context: ../../apps/bff
     container_name: ppx-bff
-    environment:
-      - OIDC_ISSUER=${OIDC_ISSUER}
-      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
-      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
-      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI}
-      - OIDC_POST_LOGOUT_REDIRECT_URI=${OIDC_POST_LOGOUT_REDIRECT_URI}
-      - COOKIE_NAME=paradox_sid
-      - COOKIE_SECURE=false
-      - COOKIE_SAMESITE=Lax
-      - REDIS_URL=redis://redis:6379
-      - SESSION_TTL_SECONDS=604800
-      - PORT=3000
+    env_file:
+      - ../../apps/bff/.env        # <— HIER holt er alle OIDC_/COOKIE_/REDIS_ Werte
     depends_on:
       keycloak:
         condition: service_started
@@ -91,17 +79,14 @@ services:
   nginx:
     image: nginx:1.27
     container_name: ppx-nginx
-    # Variante A: du hast eine komplette nginx.conf → dann so:
     volumes:
       - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
-      # Wenn du stattdessen nur eine server{}-Datei hast,
-      # nimm diese Zeile und entferne die obige:
-      # - ../nginx/dev.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "80:80"
     depends_on:
       - keycloak
       - bff
+    restart: unless-stopped
     networks: [edge, core]
 
 volumes:
