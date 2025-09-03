@@ -22,7 +22,8 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     container_name: ppx-keycloak
-    command: ["start-dev", "--http-relative-path=/auth"]
+    # Health/Paths liegen unter /auth, deshalb relative path beibehalten:
+    command: ["start-dev", "--http-relative-path=/auth", "--hostname-strict=false"]
     environment:
       KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASS:-admin}
@@ -37,9 +38,10 @@ services:
       postgres_keycloak:
         condition: service_healthy
     expose:
-      - "8080"   # nur intern
+      - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || exit 1"]
+      # WICHTIG: mit /auth prefix!
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/auth/health/ready || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -89,8 +91,12 @@ services:
   nginx:
     image: nginx:1.27
     container_name: ppx-nginx
+    # Variante A: du hast eine komplette nginx.conf → dann so:
     volumes:
       - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
+      # Wenn du stattdessen nur eine server{}-Datei hast,
+      # nimm diese Zeile und entferne die obige:
+      # - ../nginx/dev.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "80:80"
     depends_on:
