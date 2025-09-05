@@ -4,7 +4,7 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
-import * as oidc from "openid-client";     // v6: Funktions-API als Namespace
+import * as oidc from "openid-client"; // v6: Funktions-API als Namespace
 import Redis from "ioredis";
 
 /* =========================================
@@ -12,17 +12,16 @@ import Redis from "ioredis";
  * ======================================= */
 const {
   // OIDC / Keycloak
-  OIDC_ISSUER,                    // z.B. http://keycloak:8080/auth/realms/paradoxon (DEV) | https://idp.tld/realms/...
+  OIDC_ISSUER,                    // z.B. https://nginx:8443/auth/realms/paradoxon
   OIDC_CLIENT_ID,                 // z.B. bff
-  OIDC_CLIENT_SECRET,             // confidential client → Secret
+  OIDC_CLIENT_SECRET,             // (optional) nur bei confidential client
   OIDC_REDIRECT_URI,              // z.B. http://192.168.178.117/bff/callback
   OIDC_POST_LOGOUT_REDIRECT_URI,  // z.B. http://192.168.178.117/
-  OIDC_ALLOW_INSECURE_HTTP = "false", // DEV: "true" erlaubt HTTP zum Issuer
 
   // Cookies & Session
   COOKIE_NAME = "paradox_sid",
-  COOKIE_SECURE = "false",        // PROD: "true" (nur über HTTPS)
-  COOKIE_SAMESITE = "Lax",        // PROD: "Strict" oder "None"(+Secure)
+  COOKIE_SECURE = "false",        // außen noch HTTP -> false
+  COOKIE_SAMESITE = "Lax",
   REDIS_URL = "redis://redis:6379",
   SESSION_TTL_SECONDS = "604800", // 7 Tage
 
@@ -34,7 +33,7 @@ const bool = (v) => String(v).toLowerCase() === "true";
 const makeId = (n = 32) => crypto.randomBytes(n).toString("base64url");
 const safeJsonParse = (raw) => { try { return raw ? JSON.parse(raw) : null; } catch { return null; } };
 
-// Pflicht-ENV früh prüfen (klarer Fail statt später kryptisch)
+// Pflicht-ENV früh prüfen
 function assertEnv(name, val) {
   if (!val) {
     console.error(`[ENV] ${name} fehlt.`);
@@ -47,16 +46,7 @@ assertEnv("OIDC_REDIRECT_URI", OIDC_REDIRECT_URI);
 assertEnv("OIDC_POST_LOGOUT_REDIRECT_URI", OIDC_POST_LOGOUT_REDIRECT_URI);
 
 /* =========================================
- * 2) DEV: HTTP zu Issuer erlauben (nur lokal!)
- *    openid-client v6 verbietet HTTP standardmäßig.
- * ======================================= */
-if (bool(OIDC_ALLOW_INSECURE_HTTP)) {
-  // ACHTUNG: nur in DEV verwenden!
-  oidc.custom.setHttpOptionsDefaults({ allowInsecureRequests: true });
-}
-
-/* =========================================
- * 3) Redis – State & Session
+ * 2) Redis – State & Session
  * ======================================= */
 const redis = new Redis(REDIS_URL, { lazyConnect: true });
 await redis.connect().catch((e) => {
@@ -65,28 +55,36 @@ await redis.connect().catch((e) => {
 });
 
 /* =========================================
- * 4) OIDC Discovery (v6 Funktions-API)
- *    → liefert eine „Konfiguration“ (server/client Metadata + Helper)
+ * 3) OIDC Discovery (v6 Funktions-API) mit Retry
  * ======================================= */
 let conf;
-try {
+async function discoverWithRetry(retries = 30, delayMs = 5000) {
   const issuerUrl = new URL(String(OIDC_ISSUER));
-  conf = await oidc.discovery(issuerUrl, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET);
-} catch (e) {
-  console.error("OIDC Discovery fehlgeschlagen:", e);
-  process.exit(1);
+  for (let i = 0; i < retries; i++) {
+    try {
+      conf = await oidc.discovery(issuerUrl, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET);
+      console.log("OIDC Discovery erfolgreich.");
+      return;
+    } catch (e) {
+      console.error(`OIDC Discovery fehlgeschlagen (Versuch ${i + 1}/${retries}):`, e.message);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  console.error("OIDC Discovery nach allen Versuchen fehlgeschlagen – weiter ohne conf.");
 }
 
+await discoverWithRetry();
+
 /* =========================================
- * 5) Express Setup
+ * 4) Express Setup
  * ======================================= */
 const app = express();
-app.set("trust proxy", 1);     // wichtig hinter nginx/Proxy
+app.set("trust proxy", 1);
 app.use(express.json());
 app.use(cookieParser());
 
 /* =========================================
- * 6) Middlewares & Helpers
+ * 5) Middlewares & Helpers
  * ======================================= */
 async function loadSession(req, _res, next) {
   try {
@@ -121,12 +119,12 @@ function requireCsrf(req, res, next) {
 }
 
 /* =========================================
- * 7) Health
+ * 6) Health
  * ======================================= */
 app.get("/bff/health", (_req, res) => res.type("text").send("bff: ok\n"));
 
 /* =========================================
- * 8) /bff/login – Authorization Code + PKCE
+ * 7) /bff/login – Authorization Code + PKCE
  * ======================================= */
 app.get("/bff/login",
   rateLimit({ keyPrefix: "login", limit: 12, windowSec: 60 }),
@@ -153,7 +151,7 @@ app.get("/bff/login",
 );
 
 /* =========================================
- * 9) /bff/callback – Code → Tokens + Session
+ * 8) /bff/callback – Code → Tokens + Session
  * ======================================= */
 app.get("/bff/callback", async (req, res, next) => {
   try {
@@ -194,7 +192,7 @@ app.get("/bff/callback", async (req, res, next) => {
     };
     await redis.setex(`sess:${sid}`, parseInt(SESSION_TTL_SECONDS, 10), JSON.stringify(session));
 
-    // Cookies setzen
+    // Cookies
     const secure   = bool(COOKIE_SECURE);
     const sameSite = COOKIE_SAMESITE; // "Lax" | "Strict" | "None"
     if (sameSite === "None" && !secure) {
@@ -211,7 +209,7 @@ app.get("/bff/callback", async (req, res, next) => {
 
     const csrf = makeId(16);
     res.cookie("paradox_csrf", csrf, {
-      httpOnly: false, // Frontend muss lesen können
+      httpOnly: false,
       secure,
       sameSite,
       path: "/",
@@ -223,7 +221,7 @@ app.get("/bff/callback", async (req, res, next) => {
 });
 
 /* =========================================
- * 10) /bff/me – Session-User
+ * 9) /bff/me – Session-User
  * ======================================= */
 app.get("/bff/me", loadSession, (req, res) => {
   if (!req.session) return res.status(401).json({ ok: false, user: null });
@@ -232,7 +230,7 @@ app.get("/bff/me", loadSession, (req, res) => {
 });
 
 /* =========================================
- * 11) /bff/refresh – Refresh Token
+ * 10) /bff/refresh – Refresh Token
  * ======================================= */
 app.post("/bff/refresh", requireCsrf, loadSession, async (req, res) => {
   if (!req.session?.refresh_token) return res.status(401).json({ ok: false });
@@ -251,7 +249,7 @@ app.post("/bff/refresh", requireCsrf, loadSession, async (req, res) => {
 });
 
 /* =========================================
- * 12) /bff/logout – lokale Session + optional IdP-End-Session
+ * 11) /bff/logout – lokale Session + optional End-Session am IdP
  * ======================================= */
 app.post("/bff/logout", requireCsrf, loadSession, async (req, res) => {
   try { if (req.sid) await redis.del(`sess:${req.sid}`); } catch {}
@@ -272,7 +270,7 @@ app.post("/bff/logout", requireCsrf, loadSession, async (req, res) => {
 });
 
 /* =========================================
- * 13) Error-Handler
+ * 12) Error-Handler
  * ======================================= */
 app.use((err, _req, res, _next) => {
   console.error("Unhandled error:", err);
@@ -280,7 +278,7 @@ app.use((err, _req, res, _next) => {
 });
 
 /* =========================================
- * 14) Start
+ * 13) Start
  * ======================================= */
 app.listen(parseInt(PORT, 10), () => {
   console.log(`BFF listening on ${PORT}`);

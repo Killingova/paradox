@@ -1,9 +1,6 @@
-# ~/paradox/infra/compose/docker-compose.yml
-
 services:
   postgres_keycloak:
     image: postgres:16
-    container_name: ppx-kc-postgres
     environment:
       POSTGRES_DB: ${KC_DB_NAME:-keycloak}
       POSTGRES_USER: ${KC_DB_USER:-kc}
@@ -17,15 +14,14 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    networks: [core]
+    networks:
+      core:
+        aliases:
+          - postgres_keycloak
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
-    container_name: ppx-keycloak
-    command:
-      - start-dev
-      - --http-relative-path=/auth
-      - --hostname-strict=false
+    command: ["start-dev","--http-relative-path=/auth","--hostname-strict=false"]
     environment:
       KEYCLOAK_ADMIN: ${KC_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASS:-admin}
@@ -39,13 +35,15 @@ services:
     depends_on:
       postgres_keycloak:
         condition: service_healthy
-    expose: ["8080","9000"]   # Hinweis: kein Healthcheck hier
+    expose: ["8080","9000"]
     restart: unless-stopped
-    networks: [core]
+    networks:
+      core:
+        aliases:
+          - keycloak
 
   redis:
     image: redis:7
-    container_name: ppx-redis
     command: ["redis-server","--appendonly","yes"]
     volumes:
       - redisdata:/data
@@ -55,26 +53,39 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
-    networks: [core]
+    networks:
+      core:
+        aliases:
+          - redis
 
   bff:
     build:
       context: ../../apps/bff
       dockerfile: Dockerfile
     image: compose-bff
-    container_name: compose-bff-1
-    env_file:
-      - ../../apps/bff/.env
     environment:
-      PORT: 3000
-      REDIS_URL: redis://redis:6379
-      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
-      COOKIE_SAMESITE: "${COOKIE_SAMESITE:-Lax}"
-      SESSION_TTL_SECONDS: "${SESSION_TTL_SECONDS:-604800}"
+      PORT: "3000"
       TZ: ${TZ:-Europe/Berlin}
+
+      # Redis + Session
+      REDIS_URL: "redis://redis:6379"
+      SESSION_TTL_SECONDS: "604800"
+
+      # Cookies (TLS aktiv)
+      COOKIE_SECURE: "true"
+      COOKIE_SAMESITE: "Lax"
+
+      # OIDC über Nginx (immer HTTPS)
+      OIDC_ISSUER: "https://nginx:8443/auth/realms/paradoxon"
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+
+      # Redirects (Browser sieht nur Domain mit HTTPS)
+      OIDC_CLIENT_ID: "bff"
+      OIDC_REDIRECT_URI: "https://pfad-des-paradoxons.de/bff/callback"
+      OIDC_POST_LOGOUT_REDIRECT_URI: "https://pfad-des-paradoxons.de/"
     depends_on:
       keycloak:
-        condition: service_started     # <— geändert
+        condition: service_started
       redis:
         condition: service_healthy
     expose: ["3000"]
@@ -84,25 +95,32 @@ services:
       timeout: 5s
       retries: 12
     restart: unless-stopped
-    networks: [core, edge]
+    networks:
+      core:
+        aliases:
+          - bff
+      edge:
 
   nginx:
     image: nginx:1.27
-    container_name: ppx-nginx
     volumes:
       - ../nginx/dev.conf:/etc/nginx/nginx.conf:ro
       - ../nginx/keycloak-ssl.conf:/etc/nginx/conf.d/keycloak-ssl.conf:ro
       - ../nginx/tls:/etc/nginx/tls:ro
     ports:
       - "80:80"
-      - "8443:8443"
+      - "443:8443"
     depends_on:
       keycloak:
-        condition: service_started     # <— geändert
+        condition: service_started
       bff:
         condition: service_healthy
     restart: unless-stopped
-    networks: [edge, core]
+    networks:
+      core:
+        aliases:
+          - nginx
+      edge:
 
 volumes:
   kc_pgdata:
